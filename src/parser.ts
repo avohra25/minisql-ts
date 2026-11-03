@@ -5,7 +5,7 @@
  *      < (& | << >>) < (+ -) < (* / %) < || < unary (- + ~) < primary
  */
 import type {
-  BinaryOp, ColumnDef, CompoundOp, CreateTableStmt, Expr, FromItem, OrderTerm,
+  BinaryOp, ColumnDef, CommonTableExpr, CompoundOp, CreateTableStmt, Expr, FromItem, OrderTerm,
   SelectCore, SelectItem, SelectStmt, Statement,
 } from "./ast";
 import { SqlSyntaxError, tokenize, type Token } from "./lexer";
@@ -16,7 +16,7 @@ const RESERVED = new Set([
   "EXCEPT", "JOIN", "INNER", "LEFT", "CROSS", "OUTER", "ON", "USING", "AND", "OR", "NOT", "AS",
   "BY", "INSERT", "UPDATE", "DELETE", "SET", "VALUES", "INTO", "CREATE", "DROP", "TABLE", "CASE",
   "WHEN", "THEN", "ELSE", "END", "IS", "IN", "LIKE", "BETWEEN", "NULL", "DISTINCT", "ALL",
-  "EXISTS", "CAST", "ASC", "DESC", "NATURAL", "DEFAULT", "PRIMARY", "UNIQUE", "CHECK",
+  "EXISTS", "CAST", "ASC", "DESC", "NATURAL", "DEFAULT", "PRIMARY", "UNIQUE", "CHECK", "WITH",
 ]);
 
 export class Parser {
@@ -86,6 +86,11 @@ export class Parser {
     return this.fail(`expected ${what}`);
   }
 
+  /** True if a SELECT statement (SELECT, VALUES or WITH ...) starts at the given offset. */
+  private isSelectStart(offset = 0): boolean {
+    return this.isKw("SELECT", offset) || this.isKw("VALUES", offset) || this.isKw("WITH", offset);
+  }
+
   private isIdentifier(offset = 0): boolean {
     const t = this.peek(offset);
     return t.kind === "ident" && (t.quoted || !RESERVED.has(t.upper));
@@ -109,7 +114,7 @@ export class Parser {
   }
 
   statement(): Statement {
-    if (this.isKw("SELECT") || this.isKw("VALUES") || this.isOp("(")) return this.select();
+    if (this.isSelectStart() || this.isOp("(")) return this.select();
     if (this.acceptKw("CREATE")) return this.createTable();
     if (this.acceptKw("DROP")) {
       this.expectKw("TABLE");
@@ -229,7 +234,7 @@ export class Parser {
     this.expectKw("INTO");
     const table = this.identifier("table name");
     let columns: string[] | undefined;
-    if (this.isOp("(") && !this.isKw("SELECT", 1)) columns = this.nameList();
+    if (this.isOp("(") && !this.isSelectStart(1)) columns = this.nameList();
     if (this.acceptKw("DEFAULT", "VALUES")) {
       return { kind: "insert", table, columns, source: { kind: "defaults" }, orReplace, orIgnore };
     }
@@ -258,6 +263,7 @@ export class Parser {
   // ----------------------------------------------------------------- SELECT
 
   select(): SelectStmt {
+    const withClause = this.isKw("WITH") ? this.withClause() : undefined;
     const core = this.selectCore();
     const compounds: { op: CompoundOp; core: SelectCore }[] = [];
     for (;;) {
@@ -293,7 +299,33 @@ export class Parser {
         limit = this.expr();
       }
     }
-    return { kind: "select", core, compounds, orderBy, limit, offset };
+    const stmt: SelectStmt = { kind: "select", core, compounds, orderBy, limit, offset };
+    if (withClause) stmt.with = withClause;
+    return stmt;
+  }
+
+  /** WITH [RECURSIVE] name [(col, ...)] AS [[NOT] MATERIALIZED] (select), ... */
+  private withClause(): { recursive: boolean; ctes: CommonTableExpr[] } {
+    this.expectKw("WITH");
+    const recursive = this.acceptKw("RECURSIVE");
+    const ctes: CommonTableExpr[] = [];
+    do {
+      const start = this.peek().start;
+      const name = this.identifier("common table expression name");
+      if (ctes.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+        throw new SqlSyntaxError(`duplicate WITH table name: ${name}`, start);
+      }
+      const cte: CommonTableExpr = { name, query: undefined as unknown as SelectStmt };
+      if (this.isOp("(")) cte.columns = this.nameList();
+      this.expectKw("AS");
+      // materialization hints are accepted and ignored: every CTE is materialized once
+      if (!this.acceptKw("MATERIALIZED")) this.acceptKw("NOT", "MATERIALIZED");
+      this.expectOp("(");
+      cte.query = this.select();
+      this.expectOp(")");
+      ctes.push(cte);
+    } while (this.acceptOp(","));
+    return { recursive, ctes };
   }
 
   private selectCore(): SelectCore {
@@ -372,7 +404,7 @@ export class Parser {
 
   private tableOrSubquery(): FromItem {
     if (this.acceptOp("(")) {
-      if (this.isKw("SELECT") || this.isKw("VALUES")) {
+      if (this.isSelectStart()) {
         const query = this.select();
         this.expectOp(")");
         this.acceptKw("AS");
@@ -463,7 +495,7 @@ export class Parser {
 
   private inTail(expr: Expr, not: boolean): Expr {
     this.expectOp("(");
-    if (this.isKw("SELECT") || this.isKw("VALUES")) {
+    if (this.isSelectStart()) {
       const query = this.select();
       this.expectOp(")");
       return { kind: "inSelect", expr, query, not };
@@ -577,7 +609,7 @@ export class Parser {
       return { kind: "param", key: t.value };
     }
     if (this.acceptOp("(")) {
-      if (this.isKw("SELECT") || this.isKw("VALUES")) {
+      if (this.isSelectStart()) {
         const query = this.select();
         this.expectOp(")");
         return { kind: "subquery", query };

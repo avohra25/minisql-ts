@@ -175,6 +175,27 @@ function genQuery(r: Rng): string {
   }
 }
 
+/** Queries built around WITH clauses (separate generator so the older seeds stay unchanged). */
+function genCteQuery(r: Rng): string {
+  const t1cols = ["a", "b"];
+  orderRng = r;
+  switch (r.int(0, 4)) {
+    case 0:
+      return `WITH x AS (SELECT ${intExpr(r, t1cols)} AS v, b FROM t1 WHERE ${pred(r, t1cols, 0, ["c"])}) SELECT v, count(*), sum(b) FROM x GROUP BY v${orderAll(3)}`;
+    case 1: {
+      const type = r.pick(["JOIN", "LEFT JOIN"]);
+      return `WITH x(p, q) AS (SELECT a, ${intExpr(r, ["a", "d"])} FROM t2), y AS (SELECT a, b FROM t1 WHERE ${pred(r, t1cols)}) SELECT y.a, y.b, x.q FROM y ${type} x ON x.p = y.b${orderAll(3)}`;
+    }
+    case 2:
+      return `SELECT a, (WITH m AS (SELECT d FROM t2 WHERE t2.a ${r.pick(["=", "<", ">="])} t1.${r.pick(t1cols)}) SELECT ${r.pick(["max(d)", "count(*)", "sum(d)"])} FROM m) FROM t1${orderAll(2)}`;
+    case 3:
+      // forward reference, and two references to the same CTE
+      return `WITH x AS (SELECT v FROM y WHERE ${pred(r, ["v"])}), y AS (SELECT ${intExpr(r, t1cols)} AS v FROM t1) SELECT (SELECT count(*) FROM x), (SELECT count(*) FROM y), (SELECT sum(v) FROM x)`;
+    default:
+      return `SELECT a, b FROM t1 WHERE ${r.pick(["a", "b"])} ${r.chance(0.3) ? "NOT " : ""}IN (WITH k AS (SELECT ${r.pick(["a", "d", "a + d"])} AS v FROM t2 WHERE ${pred(r, ["a", "d"])}) SELECT v FROM k)${orderAll(2)}`;
+  }
+}
+
 function genDml(r: Rng): string {
   const t1cols = ["a", "b"];
   switch (r.int(0, 3)) {
@@ -254,6 +275,10 @@ const SEEDS = Number(process.env.FUZZ_SEEDS ?? 150);
 describe("differential testing against SQLite", () => {
   test(`random queries (${SEEDS} seeds x 25 queries)`, () => {
     for (let seed = 1; seed <= SEEDS; seed++) runBoth(seed, 25, genQuery);
+  });
+
+  test(`random WITH queries (${SEEDS} seeds x 10 queries)`, () => {
+    for (let seed = 20_001; seed <= 20_000 + SEEDS; seed++) runBoth(seed, 10, genCteQuery);
   });
 
   test(`random DML sequences (${SEEDS} seeds x 8 statements)`, () => {

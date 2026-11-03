@@ -6,7 +6,7 @@
  * row plus, for aggregate queries, the rows of the current group) whose parent
  * chain gives correlated subqueries access to outer rows.
  */
-import type { Expr, FromItem, OrderTerm, SelectCore, SelectItem, SelectStmt } from "./ast";
+import type { CommonTableExpr, Expr, FromItem, OrderTerm, SelectCore, SelectItem, SelectStmt } from "./ast";
 import { callAggregate, callScalar, isAggregateCall, like } from "./functions";
 import {
   SqlError, castValue, compareNumbers, compareValues, fromBool, intOrReal, isNumeric, keyOf,
@@ -48,6 +48,28 @@ export interface ExecContext {
   params: Params;
   /** Results of uncorrelated subqueries, valid for one statement. */
   subqueryCache: Map<SelectStmt, Relation>;
+  /** Common table expressions in scope (innermost first). */
+  ctes?: CteFrame;
+}
+
+/** A WITH-clause table visible to the query being executed. */
+interface CteBinding {
+  cte: CommonTableExpr;
+  /** CTEs visible inside this one's body (all of its WITH clause, plus enclosing ones). */
+  env: CteFrame | undefined;
+  /** Scope of the query the WITH clause belongs to. */
+  outer: Scope | undefined;
+  result?: Relation;
+  /** True while the body is being materialized (a reference then is circular). */
+  evaluating?: boolean;
+  /** The body read a column of an enclosing query, so its result depends on the outer row. */
+  correlated?: boolean;
+}
+
+interface CteFrame {
+  name: string;
+  binding: CteBinding;
+  parent?: CteFrame;
 }
 
 const EMPTY_SCOPE: Scope = { columns: [], row: [] };
@@ -378,6 +400,12 @@ function runSubquery(query: SelectStmt, scope: Scope, ctx: ExecContext): Relatio
 function scanFrom(from: FromItem, ctx: ExecContext, outer: Scope | undefined): Relation {
   switch (from.kind) {
     case "table": {
+      const binding = lookupCte(ctx.ctes, from.name);
+      if (binding) {
+        const rel = cteRelation(binding, ctx, outer);
+        const alias = from.alias ?? binding.cte.name;
+        return { columns: rel.columns.map((c) => ({ table: alias, name: c.name })), rows: rel.rows };
+      }
       const t = ctx.catalog.getTable(from.name);
       const alias = from.alias ?? t.name;
       return { columns: t.columns.map((c) => ({ table: alias, name: c.name })), rows: t.rows };
@@ -389,6 +417,70 @@ function scanFrom(from: FromItem, ctx: ExecContext, outer: Scope | undefined): R
     case "join":
       return join(from, ctx, outer);
   }
+}
+
+// ------------------------------------------------------------------- WITH
+
+function lookupCte(frame: CteFrame | undefined, name: string): CteBinding | undefined {
+  for (let f = frame; f; f = f.parent) if (eq(f.name, name)) return f.binding;
+  return undefined;
+}
+
+/** Bring a WITH clause's tables into scope for the duration of `body`. */
+function withCtes<T>(stmt: SelectStmt, ctx: ExecContext, outer: Scope | undefined, body: () => T): T {
+  if (!stmt.with) return body();
+  const saved = ctx.ctes;
+  try {
+    // like SQLite, every CTE can see every other one in the same WITH clause
+    const bindings = stmt.with.ctes.map((cte): CteBinding => ({ cte, env: undefined, outer }));
+    for (const binding of bindings) ctx.ctes = { name: binding.cte.name, binding, parent: ctx.ctes };
+    for (const binding of bindings) binding.env = ctx.ctes;
+    return body();
+  } finally {
+    ctx.ctes = saved;
+  }
+}
+
+/** Run `fn` with the CTE environment of `binding` (lexical, not the caller's). */
+function inEnv<T>(binding: CteBinding, ctx: ExecContext, fn: () => T): T {
+  const saved = ctx.ctes;
+  ctx.ctes = binding.env;
+  try {
+    return fn();
+  } finally {
+    ctx.ctes = saved;
+  }
+}
+
+function renameColumns(binding: CteBinding, names: string[]): ColumnInfo[] {
+  const declared = binding.cte.columns;
+  if (declared && declared.length !== names.length) {
+    throw new SqlError(`table ${binding.cte.name} has ${names.length} values for ${declared.length} columns`);
+  }
+  return (declared ?? names).map((name) => ({ name }));
+}
+
+/** Materialize a CTE on first use; later references in the same statement reuse the rows. */
+function cteRelation(binding: CteBinding, ctx: ExecContext, site: Scope | undefined): Relation {
+  if (!binding.result) {
+    if (binding.evaluating) throw new SqlError(`circular reference: ${binding.cte.name}`);
+    binding.evaluating = true;
+    const probe = { used: false };
+    const outer: Scope = { columns: [], row: [], parent: binding.outer, probe };
+    try {
+      const rel = inEnv(binding, ctx, () => executeSelect(binding.cte.query, ctx, outer));
+      binding.result = { columns: renameColumns(binding, rel.columnNames), rows: rel.rows };
+    } finally {
+      binding.evaluating = false;
+    }
+    binding.correlated = probe.used;
+  }
+  if (binding.correlated) {
+    // The rows depend on the row of the query that owns the WITH clause, so any subquery
+    // between that query and this reference must not be cached as uncorrelated.
+    for (let s = site; s && s !== binding.outer; s = s.parent) if (s.probe) s.probe.used = true;
+  }
+  return binding.result;
 }
 
 function join(j: Extract<FromItem, { kind: "join" }>, ctx: ExecContext, outer: Scope | undefined): Relation {
@@ -648,6 +740,10 @@ function limitValue(e: Expr | undefined, ctx: ExecContext, what: string): number
 }
 
 export function executeSelect(stmt: SelectStmt, ctx: ExecContext, outer?: Scope): Relation & { columnNames: string[] } {
+  return withCtes(stmt, ctx, outer, () => executeBody(stmt, ctx, outer));
+}
+
+function executeBody(stmt: SelectStmt, ctx: ExecContext, outer: Scope | undefined): Relation & { columnNames: string[] } {
   let columns: string[];
   let rows: Value[][];
   if (stmt.compounds.length === 0) {

@@ -53,8 +53,21 @@ export interface OrderTerm {
   nullsFirst?: boolean;
 }
 
+/** One `name [(columns)] AS (select)` entry of a WITH clause. */
+export interface CommonTableExpr {
+  name: string;
+  columns?: string[];
+  query: SelectStmt;
+}
+
+export interface WithClause {
+  recursive: boolean;
+  ctes: CommonTableExpr[];
+}
+
 export interface SelectStmt {
   kind: "select";
+  with?: WithClause;
   core: SelectCore;
   compounds: { op: CompoundOp; core: SelectCore }[];
   orderBy: OrderTerm[];
