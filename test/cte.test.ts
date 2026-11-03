@@ -74,3 +74,66 @@ describe("WITH (common table expressions)", () => {
     expect(rows("WITH a AS (SELECT v * 2 AS w FROM b), b(v) AS (VALUES (1), (5)) SELECT w FROM a ORDER BY w")).toEqual([[2], [10]]);
   });
 });
+
+describe("WITH RECURSIVE", () => {
+  test("counts", () => {
+    expect(rows("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c")).toEqual([[1], [2], [3], [4], [5]]);
+    // SQLite doesn't insist on the keyword either
+    expect(rows("WITH c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT sum(n) FROM c")).toEqual([[6]]);
+  });
+
+  test("walks a hierarchy", () => {
+    const sql = `
+      WITH RECURSIVE chain(id, name, depth, path) AS (
+        SELECT id, name, 0, name FROM emp WHERE manager IS NULL
+        UNION ALL
+        SELECT e.id, e.name, depth + 1, path || '/' || e.name FROM emp e JOIN chain ON e.manager = chain.id
+      )
+      SELECT name, depth, path FROM chain ORDER BY path`;
+    expect(rows(sql)).toEqual([
+      ["ann", 0, "ann"],
+      ["bob", 1, "ann/bob"],
+      ["cy", 1, "ann/cy"],
+      ["di", 2, "ann/cy/di"],
+      ["ed", 3, "ann/cy/di/ed"],
+    ]);
+  });
+
+  test("UNION stops at rows already seen, so cycles terminate", () => {
+    expect(rows("WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT (n + 1) % 4 FROM c) SELECT n FROM c")).toEqual([[1], [2], [3], [0]]);
+  });
+
+  test("rows are processed one at a time, through every recursive SELECT", () => {
+    const sql = "WITH RECURSIVE c(n, k) AS (SELECT 1, 0 UNION ALL SELECT n + 1, k FROM c WHERE n < 3 UNION ALL SELECT n + 10, k + 1 FROM c WHERE n < 3) SELECT * FROM c";
+    expect(rows(sql)).toEqual([[1, 0], [2, 0], [11, 1], [3, 0], [12, 1]]);
+  });
+
+  test("ORDER BY makes the queue a priority queue", () => {
+    const base = "WITH RECURSIVE c(n) AS (SELECT 5 UNION ALL SELECT 3 UNION ALL SELECT n - 1 FROM c WHERE n > 0 ORDER BY 1";
+    expect(rows(`${base}) SELECT n FROM c`).flat()).toEqual([3, 2, 1, 0, 5, 4, 3, 2, 1, 0]);
+    expect(rows(`${base} DESC) SELECT n FROM c`).flat()).toEqual([5, 4, 3, 3, 2, 2, 1, 1, 0, 0]);
+  });
+
+  test("LIMIT ends an unbounded recursion; OFFSET skips but keeps going", () => {
+    expect(rows("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n * 2 FROM c LIMIT 5) SELECT n FROM c").flat()).toEqual([1, 2, 4, 8, 16]);
+    expect(rows("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c LIMIT 4 OFFSET 2) SELECT n FROM c").flat()).toEqual([3, 4, 5, 6]);
+  });
+
+  test("runaway recursion hits the row limit", () => {
+    const small = new Database({ maxRecursiveRows: 100 });
+    expect(() => small.exec("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT count(*) FROM c")).toThrow(
+      "recursive CTE c produced more than 100 rows",
+    );
+    expect(small.exec("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 100) SELECT count(*) FROM c").rows).toEqual([[100]]);
+  });
+
+  test("errors match SQLite", () => {
+    const err = (sql: string, msg: string) => expect(() => rows(sql)).toThrow(msg);
+    err("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c) SELECT * FROM c", "recursive aggregate queries not supported");
+    err("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c, c AS d WHERE c.n < 3) SELECT * FROM c", "multiple references to recursive table: c");
+    err("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < (SELECT max(n) FROM c)) SELECT * FROM c", "multiple recursive references: c");
+    err("WITH RECURSIVE c(n) AS (SELECT n FROM c UNION ALL SELECT 1) SELECT * FROM c", "circular reference: c");
+    err("WITH RECURSIVE c(n) AS (SELECT 1 INTERSECT SELECT n FROM c) SELECT * FROM c", "circular reference: c");
+    err("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n, n FROM c) SELECT * FROM c", "do not have the same number of result columns");
+  });
+});

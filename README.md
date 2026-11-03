@@ -28,6 +28,7 @@ minisql> SELECT coalesce(dept, '-') AS dept, count(*) AS n, avg(salary) AS avg
 - **Subqueries:** scalar subqueries, `IN (SELECT ...)`, `[NOT] EXISTS`, and derived tables in `FROM`, correlated or not. A subquery that never reads the outer row is detected at runtime and cached for the rest of the statement.
 - **Set operations:** `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT`.
 - **Common table expressions:** `WITH name [(columns)] AS (SELECT ...)`, several per clause and in any order, usable wherever a `SELECT` is (subqueries, `INSERT ... SELECT`, `CREATE TABLE ... AS`). Each one is computed at most once per statement, unless it reads a column of an enclosing query. The `MATERIALIZED` hints are accepted and ignored.
+- **Recursive queries:** `WITH RECURSIVE` with SQLite's semantics. Rows from the anchor `SELECT`s go into a queue, and each row taken from it is emitted and fed to every recursive `SELECT`. `UNION` skips rows already seen (so walks over cyclic graphs finish), `ORDER BY` turns the queue into a priority queue, and `LIMIT`/`OFFSET` apply as rows come out, so `LIMIT` can stop an unbounded recursion. A runaway query fails after 1,000,000 rows (configurable with `maxRecursiveRows`).
 - **Expressions:** arithmetic, `||`, bitwise operators, comparisons, `AND`/`OR`/`NOT` with three-valued logic, `IS [NOT]`, `[NOT] BETWEEN`, `[NOT] IN (...)`, `[NOT] LIKE ... [ESCAPE]`, `CASE`, `CAST`, and `?`, `?N`, `:name`, `@name` and `$name` parameters.
 - **Functions:** `abs`, `coalesce`, `ifnull`, `nullif`, `iif`, `length`, `lower`, `upper`, `substr`, `trim`/`ltrim`/`rtrim`, `replace`, `instr`, `round`, `sign`, `typeof`, `printf`, `concat`, and scalar `min`/`max`. Aggregates are `count(*)`, `count`, `sum`, `total`, `avg`, `min`, `max` and `group_concat`, each also with `DISTINCT`.
 - **DDL and DML:** `CREATE TABLE [IF NOT EXISTS]` (including `AS SELECT`), `DROP TABLE [IF EXISTS]`, `INSERT` (`VALUES`, `SELECT`, `DEFAULT VALUES`, `OR IGNORE`, `OR REPLACE`), `UPDATE` and `DELETE`.
@@ -59,7 +60,7 @@ db.run("UPDATE kv SET v = v * 10 WHERE k = :k", { k: "a" }); // { changes: 1, la
 db.execute("SELECT 1; SELECT 2");               // raw results for every statement
 ```
 
-Integers come back as JS numbers when they fit exactly. Pass `new Database({ safeIntegers: true })` to always get `bigint`s.
+Integers come back as JS numbers when they fit exactly. Pass `new Database({ safeIntegers: true })` to always get `bigint`s, and `maxRecursiveRows` to change the recursive-CTE row limit.
 
 ## Shell
 
@@ -88,22 +89,22 @@ Rows are immutable arrays, which keeps transactions cheap. `BEGIN` snapshots eac
 
 Expressions are evaluated against a scope chain. Each scope holds the current row and, in aggregate queries, the rows of the current group, and a correlated subquery simply sees the outer row through its parent scope. When a subquery runs, a probe scope sits between it and the outer query. If no name lookup ever passes through the probe, the subquery doesn't depend on the outer row, so its result is cached for the rest of the statement.
 
-A `WITH` clause adds frames to a CTE environment that is lexical, like the scope chain: a CTE body sees the clause it's defined in and the ones around it, never the caller's. A CTE is computed the first time it's read, behind the same kind of probe scope, so one that depends on an outer row is recomputed for each row and marks the subqueries between it and its `WITH` clause as correlated.
+A `WITH` clause adds frames to a CTE environment that is lexical, like the scope chain: a CTE body sees the clause it's defined in and the ones around it, never the caller's. A CTE is computed the first time it's read, behind the same kind of probe scope, so one that depends on an outer row is recomputed for each row and marks the subqueries between it and its `WITH` clause as correlated. A recursive CTE is split at the first `SELECT` that reads it: the part before is the anchor, and the rest is run once per queued row, with the CTE bound to a one-row working table.
 
 ## Testing
 
 ```sh
 bun install
-bun test               # about 80 unit tests plus the differential fuzzer
+bun test               # about 90 unit tests plus the differential fuzzer
 bun run typecheck      # tsc --noEmit, strict mode
 FUZZ_SEEDS=20000 bun test --timeout 0 test/differential.test.ts   # a much longer fuzz run
 ```
 
-`test/differential.test.ts` builds random tables (with NULLs), queries and `UPDATE`/`DELETE`/`INSERT ... SELECT` sequences from a seeded PRNG. It runs each one on both minisql and SQLite through `bun:sqlite` and requires identical results, or an error from both. The generated statements cover filters, grouping, joins (including three-way and `USING`), correlated subqueries, set operations, derived tables, `WITH` clauses, text functions and mixed INTEGER/REAL arithmetic. A failure prints the seed and the exact SQL, so it reproduces every time. The default run checks about 5,000 statements, and a 20,000-seed run (over 600,000 statements) also passes.
+`test/differential.test.ts` builds random tables (with NULLs), queries and `UPDATE`/`DELETE`/`INSERT ... SELECT` sequences from a seeded PRNG. It runs each one on both minisql and SQLite through `bun:sqlite` and requires identical results, or an error from both. The generated statements cover filters, grouping, joins (including three-way and `USING`), correlated subqueries, set operations, derived tables, `WITH` clauses, recursive CTEs (graph walks, ordered queues with `LIMIT`), text functions and mixed INTEGER/REAL arithmetic. A failure prints the seed and the exact SQL, so it reproduces every time. The default run checks about 5,000 statements, and a 20,000-seed run (over 600,000 statements) also passes.
 
 ## Limitations
 
-This is an in-memory engine for learning and testing, not a replacement for SQLite. It has no persistence, no secondary indexes or query planner beyond the hash join, no window functions, recursive CTEs, views, triggers, `ALTER TABLE` or BLOBs, and no `CHECK` or foreign-key enforcement. Uniqueness checks use hash maps, but `UPDATE` and `DELETE` rebuild them, so each of those statements is O(table size).
+This is an in-memory engine for learning and testing, not a replacement for SQLite. It has no persistence, no secondary indexes or query planner beyond the hash join, no window functions, views, triggers, `ALTER TABLE` or BLOBs, and no `CHECK` or foreign-key enforcement. Uniqueness checks use hash maps, but `UPDATE` and `DELETE` rebuild them, so each of those statements is O(table size).
 
 ## License
 

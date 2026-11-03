@@ -142,15 +142,19 @@ export type Row = Record<string, unknown>;
 export interface DatabaseOptions {
   /** Return INTEGER values as `bigint` instead of `number` (default false: safe ints become numbers). */
   safeIntegers?: boolean;
+  /** Most rows a recursive CTE may produce before the query fails (default 1,000,000). */
+  maxRecursiveRows?: number;
 }
 
 export class Database {
   private tables = new Map<string, Table>();
   private snapshot: Map<string, Table> | undefined;
   private readonly safeIntegers: boolean;
+  private readonly maxRecursiveRows: number | undefined;
 
   constructor(options: DatabaseOptions = {}) {
     this.safeIntegers = options.safeIntegers ?? false;
+    this.maxRecursiveRows = options.maxRecursiveRows;
   }
 
   /** True while an explicit BEGIN ... COMMIT/ROLLBACK transaction is open. */
@@ -227,7 +231,7 @@ export class Database {
         return { name: t.name, columns: t.columns, rows: t.rows };
       },
     };
-    return { catalog, params, subqueryCache: new Map() };
+    return { catalog, params, subqueryCache: new Map(), maxRecursiveRows: this.maxRecursiveRows };
   }
 
   private executeStatement(stmt: Statement, params: Params): QueryResult {

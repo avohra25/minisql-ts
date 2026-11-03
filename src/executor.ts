@@ -50,6 +50,8 @@ export interface ExecContext {
   subqueryCache: Map<SelectStmt, Relation>;
   /** Common table expressions in scope (innermost first). */
   ctes?: CteFrame;
+  /** Upper bound on rows a recursive CTE may queue (default 1,000,000). */
+  maxRecursiveRows?: number;
 }
 
 /** A WITH-clause table visible to the query being executed. */
@@ -64,6 +66,8 @@ interface CteBinding {
   evaluating?: boolean;
   /** The body read a column of an enclosing query, so its result depends on the outer row. */
   correlated?: boolean;
+  /** While a recursive CTE runs: the single row the recursive step is reading. */
+  working?: Relation;
 }
 
 interface CteFrame {
@@ -462,14 +466,14 @@ function renameColumns(binding: CteBinding, names: string[]): ColumnInfo[] {
 
 /** Materialize a CTE on first use; later references in the same statement reuse the rows. */
 function cteRelation(binding: CteBinding, ctx: ExecContext, site: Scope | undefined): Relation {
+  if (binding.working) return binding.working;
   if (!binding.result) {
     if (binding.evaluating) throw new SqlError(`circular reference: ${binding.cte.name}`);
     binding.evaluating = true;
     const probe = { used: false };
     const outer: Scope = { columns: [], row: [], parent: binding.outer, probe };
     try {
-      const rel = inEnv(binding, ctx, () => executeSelect(binding.cte.query, ctx, outer));
-      binding.result = { columns: renameColumns(binding, rel.columnNames), rows: rel.rows };
+      binding.result = inEnv(binding, ctx, () => materialize(binding, ctx, outer));
     } finally {
       binding.evaluating = false;
     }
@@ -481,6 +485,174 @@ function cteRelation(binding: CteBinding, ctx: ExecContext, site: Scope | undefi
     for (let s = site; s && s !== binding.outer; s = s.parent) if (s.probe) s.probe.used = true;
   }
   return binding.result;
+}
+
+function materialize(binding: CteBinding, ctx: ExecContext, outer: Scope): Relation {
+  const q = binding.cte.query;
+  const parts = [q.core, ...q.compounds.map((c) => c.core)];
+  // The first SELECT that names the CTE in its FROM clause starts the recursive part.
+  // (SQLite does this with or without the RECURSIVE keyword.) If that is the very
+  // first SELECT there is no anchor, and the normal path reports the circular reference.
+  const k = parts.findIndex((p) => directRefs(p.from, binding.cte.name) > 0);
+  if (k <= 0) {
+    const rel = executeSelect(q, ctx, outer);
+    return { columns: renameColumns(binding, rel.columnNames), rows: rel.rows };
+  }
+  return withCtes(q, ctx, outer, () => recursive(binding, k, ctx, outer));
+}
+
+/** How many times `name` appears as a table in a FROM tree (not counting subqueries). */
+function directRefs(from: FromItem | undefined, name: string): number {
+  if (!from) return 0;
+  if (from.kind === "table") return eq(from.name, name) ? 1 : 0;
+  if (from.kind === "join") return directRefs(from.left, name) + directRefs(from.right, name);
+  return 0;
+}
+
+/** How many times `name` appears as a table anywhere under `node`, subqueries included. */
+function allRefs(node: unknown, name: string): number {
+  if (Array.isArray(node)) return node.reduce((n: number, x) => n + allRefs(x, name), 0);
+  if (!node || typeof node !== "object") return 0;
+  const o = node as Record<string, unknown>;
+  let n = o.kind === "table" && typeof o.name === "string" && eq(o.name, name) ? 1 : 0;
+  for (const v of Object.values(o)) n += allRefs(v, name);
+  return n;
+}
+
+function isAggregateCore(core: SelectCore): boolean {
+  return core.groupBy.length > 0 || !!core.having || core.columns.some((c) => c.kind === "expr" && containsAggregate(c.expr));
+}
+
+/**
+ * WITH RECURSIVE, following SQLite: rows from the anchor go into a queue; each row taken
+ * from the queue is emitted and then fed, alone, to every recursive SELECT, whose results
+ * join the queue. UNION drops rows already seen, ORDER BY turns the queue into a priority
+ * queue, LIMIT stops once enough rows are out, and OFFSET skips rows but keeps recursing.
+ */
+function recursive(binding: CteBinding, k: number, ctx: ExecContext, outer: Scope): Relation {
+  const q = binding.cte.query;
+  const name = binding.cte.name;
+  const ops = q.compounds.slice(k - 1).map((c) => c.op);
+  const op = ops[0]!;
+  if ((op !== "UNION" && op !== "UNION ALL") || ops.some((o) => o !== op)) throw new SqlError(`circular reference: ${name}`);
+  const steps = q.compounds.slice(k - 1).map((c) => c.core);
+  for (const step of steps) {
+    const direct = directRefs(step.from, name);
+    if (direct > 1) throw new SqlError(`multiple references to recursive table: ${name}`);
+    if (allRefs(step, name) > direct) throw new SqlError(`multiple recursive references: ${name}`);
+    if (isAggregateCore(step)) throw new SqlError("recursive aggregate queries not supported");
+  }
+
+  const anchor = executeBody({ kind: "select", core: q.core, compounds: q.compounds.slice(0, k - 1), orderBy: [] }, ctx, outer);
+  const columns = renameColumns(binding, anchor.columnNames);
+  const order = q.orderBy.map((t) => compoundOrderIndex(t, anchor.columnNames));
+  const limit = limitValue(q.limit, ctx, "LIMIT");
+  let skip = limitValue(q.offset, ctx, "OFFSET") ?? 0;
+  const max = ctx.maxRecursiveRows ?? 1_000_000;
+
+  const queue = order.length
+    ? new RowHeap((a, b) => compareKeys(order.map((i) => a[i]!), order.map((i) => b[i]!), q.orderBy))
+    : new RowFifo();
+  const seen = op === "UNION" ? new Set<string>() : undefined;
+  let queued = 0;
+  const enqueue = (row: Value[]) => {
+    if (seen) {
+      const key = keyOf(row);
+      if (seen.has(key)) return;
+      seen.add(key);
+    }
+    if (++queued > max) throw new SqlError(`recursive CTE ${name} produced more than ${max} rows (add a LIMIT or raise maxRecursiveRows)`);
+    queue.push(row);
+  };
+  for (const row of anchor.rows) enqueue(row);
+
+  const out: Value[][] = [];
+  try {
+    while (queue.size > 0) {
+      if (limit !== undefined && limit >= 0 && out.length >= limit) break;
+      const row = queue.pop();
+      if (skip > 0) skip--;
+      else out.push(row);
+      binding.working = { columns, rows: [row] };
+      for (const step of steps) {
+        const r = runCore(step, ctx, outer);
+        if (r.columns.length !== columns.length) {
+          throw new SqlError(`SELECTs to the left and right of ${op} do not have the same number of result columns`);
+        }
+        for (const next of r.rows) enqueue(next);
+      }
+    }
+  } finally {
+    binding.working = undefined;
+  }
+  return { columns, rows: out };
+}
+
+class RowFifo {
+  private rows: Value[][] = [];
+  private head = 0;
+  get size(): number {
+    return this.rows.length - this.head;
+  }
+  push(row: Value[]): void {
+    this.rows.push(row);
+  }
+  pop(): Value[] {
+    const row = this.rows[this.head++]!;
+    if (this.head > 1024 && this.head * 2 > this.rows.length) {
+      this.rows = this.rows.slice(this.head);
+      this.head = 0;
+    }
+    return row;
+  }
+}
+
+/** Binary min-heap; ties come out in insertion order. */
+class RowHeap {
+  private items: { row: Value[]; seq: number }[] = [];
+  private seq = 0;
+  constructor(private readonly cmp: (a: Value[], b: Value[]) => number) {}
+  get size(): number {
+    return this.items.length;
+  }
+  private less(i: number, j: number): boolean {
+    const a = this.items[i]!;
+    const b = this.items[j]!;
+    const c = this.cmp(a.row, b.row);
+    return c < 0 || (c === 0 && a.seq < b.seq);
+  }
+  private swap(i: number, j: number): void {
+    const t = this.items[i]!;
+    this.items[i] = this.items[j]!;
+    this.items[j] = t;
+  }
+  push(row: Value[]): void {
+    this.items.push({ row, seq: this.seq++ });
+    for (let i = this.items.length - 1; i > 0; ) {
+      const p = (i - 1) >> 1;
+      if (!this.less(i, p)) break;
+      this.swap(i, p);
+      i = p;
+    }
+  }
+  pop(): Value[] {
+    const top = this.items[0]!;
+    const last = this.items.pop()!;
+    if (this.items.length > 0) {
+      this.items[0] = last;
+      for (let i = 0; ; ) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < this.items.length && this.less(l, m)) m = l;
+        if (r < this.items.length && this.less(r, m)) m = r;
+        if (m === i) break;
+        this.swap(i, m);
+        i = m;
+      }
+    }
+    return top.row;
+  }
 }
 
 function join(j: Extract<FromItem, { kind: "join" }>, ctx: ExecContext, outer: Scope | undefined): Relation {
@@ -711,23 +883,25 @@ function compoundOrderIndex(t: OrderTerm, names: string[]): number {
   throw new SqlError("ORDER BY term does not match any column in the result set");
 }
 
+function compareKeys(xs: Value[], ys: Value[], terms: OrderTerm[]): number {
+  for (let k = 0; k < terms.length; k++) {
+    const t = terms[k]!;
+    const x = xs[k]!;
+    const y = ys[k]!;
+    if (x === null || y === null) {
+      if (x === y) continue;
+      const nullsFirst = t.nullsFirst ?? !t.desc;
+      return (x === null) === nullsFirst ? -1 : 1;
+    }
+    const c = compareValues(x, y);
+    if (c !== 0) return t.desc ? -c : c;
+  }
+  return 0;
+}
+
 function sortRows(rows: Value[][], keys: Value[][], terms: OrderTerm[]): Value[][] {
   const idx = rows.map((_, i) => i);
-  idx.sort((a, b) => {
-    for (let k = 0; k < terms.length; k++) {
-      const t = terms[k]!;
-      const x = keys[a]![k]!;
-      const y = keys[b]![k]!;
-      if (x === null || y === null) {
-        if (x === y) continue;
-        const nullsFirst = t.nullsFirst ?? !t.desc;
-        return (x === null) === nullsFirst ? -1 : 1;
-      }
-      const c = compareValues(x, y);
-      if (c !== 0) return t.desc ? -c : c;
-    }
-    return a - b; // stable
-  });
+  idx.sort((a, b) => compareKeys(keys[a]!, keys[b]!, terms) || a - b); // stable
   return idx.map((i) => rows[i]!);
 }
 

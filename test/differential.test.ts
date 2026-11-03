@@ -196,6 +196,35 @@ function genCteQuery(r: Rng): string {
   }
 }
 
+/** WITH RECURSIVE: counters, graph walks over t2 as an edge list, queue ordering and LIMIT. */
+function genRecursiveQuery(r: Rng): string {
+  orderRng = r;
+  const all = r.pick(["UNION ALL", "UNION"]);
+  switch (r.int(0, 3)) {
+    case 0: {
+      const step = r.int(1, 3);
+      return `WITH RECURSIVE c(n) AS (SELECT ${r.int(-3, 3)} ${all} SELECT n + ${step} FROM c WHERE n < ${r.int(0, 12)}) SELECT n, n * n FROM c`;
+    }
+    case 1: {
+      // reachability from some t1 rows, following t2 (a -> d) edges; depth bound keeps UNION ALL finite
+      const depth = r.int(1, 4);
+      // (rows from one step's join come out in plan-dependent order, so sort the result)
+      const outerOrder = orderAll(2);
+      return `WITH RECURSIVE r(x, depth) AS (SELECT a, 0 FROM t1 WHERE ${pred(r, ["a", "b"])} ${all} SELECT t2.d, depth + 1 FROM r JOIN t2 ON t2.a = r.x WHERE depth < ${depth}) SELECT x, depth FROM r${outerOrder}`;
+    }
+    case 2: {
+      // the queue order is visible through LIMIT
+      const terms = r.pick(["1", "1 DESC", "2, 1", "2 DESC, 1 DESC", "1, 2 DESC"]);
+      return `WITH RECURSIVE r(x, depth) AS (SELECT a, 0 FROM t1 ${all} SELECT t2.d, depth + 1 FROM r JOIN t2 ON t2.a = r.x WHERE depth < ${r.int(1, 3)} ORDER BY ${terms} LIMIT ${r.int(0, 15)}${r.chance(0.3) ? ` OFFSET ${r.int(0, 4)}` : ""}) SELECT x, depth FROM r`;
+    }
+    default: {
+      // two recursive steps, a stopping LIMIT, and a CTE reading another CTE
+      const m = r.int(2, 9);
+      return `WITH RECURSIVE base(v) AS (SELECT b FROM t1 WHERE b IS NOT NULL), walk(n, k) AS (SELECT min(v), 0 FROM base ${all} SELECT (n * 3 + 1) % ${m}, k + 1 FROM walk WHERE k < 6 ${all} SELECT n + 1, k + 2 FROM walk WHERE n < 3 LIMIT ${r.int(1, 25)}) SELECT n, k FROM walk`;
+    }
+  }
+}
+
 function genDml(r: Rng): string {
   const t1cols = ["a", "b"];
   switch (r.int(0, 3)) {
@@ -279,6 +308,10 @@ describe("differential testing against SQLite", () => {
 
   test(`random WITH queries (${SEEDS} seeds x 10 queries)`, () => {
     for (let seed = 20_001; seed <= 20_000 + SEEDS; seed++) runBoth(seed, 10, genCteQuery);
+  });
+
+  test(`random WITH RECURSIVE queries (${SEEDS} seeds x 10 queries)`, () => {
+    for (let seed = 30_001; seed <= 30_000 + SEEDS; seed++) runBoth(seed, 10, genRecursiveQuery);
   });
 
   test(`random DML sequences (${SEEDS} seeds x 8 statements)`, () => {
