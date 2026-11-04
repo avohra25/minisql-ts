@@ -106,9 +106,9 @@ export class Shell {
         this.done = true;
         return "";
       case ".tables":
-        return this.db.tableNames().join("  ");
+        return [...this.db.tableNames(), ...this.db.viewNames()].sort().join("  ");
       case ".schema": {
-        const names = args.length ? args : this.db.tableNames();
+        const names = args.length ? args : [...this.db.tableNames(), ...this.db.viewNames()];
         try {
           return names.map((n) => this.db.schema(n)).join("\n");
         } catch (e) {

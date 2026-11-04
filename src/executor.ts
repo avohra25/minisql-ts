@@ -41,6 +41,14 @@ export type Params = readonly Value[] | Readonly<Record<string, Value>>;
 /** What the executor needs from the database. */
 export interface Catalog {
   getTable(name: string): Relation & { name: string };
+  /** A view by name, if there is one (checked before tables). */
+  getView?(name: string): ViewDef | undefined;
+}
+
+export interface ViewDef {
+  name: string;
+  columns?: string[];
+  query: SelectStmt;
 }
 
 export interface ExecContext {
@@ -52,6 +60,10 @@ export interface ExecContext {
   ctes?: CteFrame;
   /** Upper bound on rows a recursive CTE may queue (default 1,000,000). */
   maxRecursiveRows?: number;
+  /** Views already computed in this statement. */
+  viewCache?: Map<string, Relation>;
+  /** Views being computed right now (to catch a view defined in terms of itself). */
+  activeViews?: Set<string>;
 }
 
 /** A WITH-clause table visible to the query being executed. */
@@ -410,6 +422,12 @@ function scanFrom(from: FromItem, ctx: ExecContext, outer: Scope | undefined): R
         const alias = from.alias ?? binding.cte.name;
         return { columns: rel.columns.map((c) => ({ table: alias, name: c.name })), rows: rel.rows };
       }
+      const view = ctx.catalog.getView?.(from.name);
+      if (view) {
+        const rel = viewRelation(view, ctx);
+        const alias = from.alias ?? view.name;
+        return { columns: rel.columns.map((c) => ({ table: alias, name: c.name })), rows: rel.rows };
+      }
       const t = ctx.catalog.getTable(from.name);
       const alias = from.alias ?? t.name;
       return { columns: t.columns.map((c) => ({ table: alias, name: c.name })), rows: t.rows };
@@ -420,6 +438,36 @@ function scanFrom(from: FromItem, ctx: ExecContext, outer: Scope | undefined): R
     }
     case "join":
       return join(from, ctx, outer);
+  }
+}
+
+// ------------------------------------------------------------------ views
+
+/**
+ * A view runs like a subquery that sees only the database: none of the caller's CTEs and
+ * no outer row. Its rows are computed once per statement.
+ */
+export function viewRelation(view: ViewDef, ctx: ExecContext): Relation {
+  const key = view.name.toLowerCase();
+  const cache = (ctx.viewCache ??= new Map());
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const active = (ctx.activeViews ??= new Set());
+  if (active.has(key)) throw new SqlError(`view ${view.name} is circularly defined`);
+  active.add(key);
+  const saved = ctx.ctes;
+  ctx.ctes = undefined;
+  try {
+    const rel = executeSelect(view.query, ctx);
+    if (view.columns && view.columns.length !== rel.columnNames.length) {
+      throw new SqlError(`expected ${view.columns.length} columns for '${view.name}' but got ${rel.columnNames.length}`);
+    }
+    const out: Relation = { columns: (view.columns ?? rel.columnNames).map((name) => ({ name })), rows: rel.rows };
+    cache.set(key, out);
+    return out;
+  } finally {
+    active.delete(key);
+    ctx.ctes = saved;
   }
 }
 

@@ -1,9 +1,9 @@
 /**
  * Tables, DML/DDL execution, transactions and the public `Database` API.
  */
-import type { ColumnDef, CreateTableStmt, Expr, InsertStmt, Statement } from "./ast";
+import type { ColumnDef, CreateTableStmt, CreateViewStmt, Expr, InsertStmt, Statement } from "./ast";
 import {
-  evaluate, executeSelect, type Catalog, type ExecContext, type Params, type Scope,
+  evaluate, executeSelect, type Catalog, type ExecContext, type Params, type Scope, type ViewDef,
 } from "./executor";
 import { parse } from "./parser";
 import { SqlError, affinityOf, applyAffinity, keyOf, truthy, type Affinity, type Value } from "./values";
@@ -148,7 +148,8 @@ export interface DatabaseOptions {
 
 export class Database {
   private tables = new Map<string, Table>();
-  private snapshot: Map<string, Table> | undefined;
+  private views = new Map<string, ViewDef & { sql: string }>();
+  private snapshot: { tables: Map<string, Table>; views: Map<string, ViewDef & { sql: string }> } | undefined;
   private readonly safeIntegers: boolean;
   private readonly maxRecursiveRows: number | undefined;
 
@@ -195,12 +196,18 @@ export class Database {
     return [...this.tables.values()].map((t) => t.name).sort();
   }
 
+  viewNames(): string[] {
+    return [...this.views.values()].map((v) => v.name).sort();
+  }
+
   table(name: string): Table | undefined {
     return this.tables.get(name.toLowerCase());
   }
 
-  /** Reconstruct a CREATE TABLE statement for a table. */
+  /** Reconstruct a CREATE TABLE statement for a table (or give back a view's CREATE VIEW). */
   schema(name: string): string {
+    const v = this.views.get(name.toLowerCase());
+    if (v) return `${v.sql};`;
     const t = this.table(name);
     if (!t) throw new SqlError(`no such table: ${name}`);
     const parts = t.columns.map((c, i) => {
@@ -230,6 +237,7 @@ export class Database {
         if (!t) throw new SqlError(`no such table: ${name}`);
         return { name: t.name, columns: t.columns, rows: t.rows };
       },
+      getView: (name) => this.views.get(name.toLowerCase()),
     };
     return { catalog, params, subqueryCache: new Map(), maxRecursiveRows: this.maxRecursiveRows };
   }
@@ -245,8 +253,22 @@ export class Database {
       case "createTable":
         this.createTable(stmt, ctx);
         return none;
+      case "createView":
+        this.createView(stmt);
+        return none;
+      case "dropView": {
+        const key = stmt.name.toLowerCase();
+        if (!this.views.has(key)) {
+          if (this.tables.has(key)) throw new SqlError(`use DROP TABLE to delete table ${stmt.name}`);
+          if (stmt.ifExists) return none;
+          throw new SqlError(`no such view: ${stmt.name}`);
+        }
+        this.views.delete(key);
+        return none;
+      }
       case "dropTable": {
         const key = stmt.name.toLowerCase();
+        if (this.views.has(key)) throw new SqlError(`use DROP VIEW to delete view ${stmt.name}`);
         if (!this.tables.has(key)) {
           if (stmt.ifExists) return none;
           throw new SqlError(`no such table: ${stmt.name}`);
@@ -285,7 +307,7 @@ export class Database {
         });
       case "begin":
         if (this.snapshot) throw new SqlError("cannot start a transaction within a transaction");
-        this.snapshot = new Map([...this.tables].map(([k, t]) => [k, t.clone()]));
+        this.snapshot = { tables: new Map([...this.tables].map(([k, t]) => [k, t.clone()])), views: new Map(this.views) };
         return none;
       case "commit":
         if (!this.snapshot) throw new SqlError("cannot commit - no transaction is active");
@@ -293,7 +315,8 @@ export class Database {
         return none;
       case "rollback":
         if (!this.snapshot) throw new SqlError("cannot rollback - no transaction is active");
-        this.tables = this.snapshot;
+        this.tables = this.snapshot.tables;
+        this.views = this.snapshot.views;
         this.snapshot = undefined;
         return none;
     }
@@ -302,7 +325,10 @@ export class Database {
   /** Run a DML statement so that it either fully applies or leaves the table untouched. */
   private atomically(name: string, fn: (t: Table) => QueryResult): QueryResult {
     const t = this.table(name);
-    if (!t) throw new SqlError(`no such table: ${name}`);
+    if (!t) {
+      if (this.views.has(name.toLowerCase())) throw new SqlError(`cannot modify ${name} because it is a view`);
+      throw new SqlError(`no such table: ${name}`);
+    }
     const backup = t.clone();
     try {
       return fn(t);
@@ -312,8 +338,20 @@ export class Database {
     }
   }
 
+  private createView(stmt: CreateViewStmt): void {
+    const key = stmt.name.toLowerCase();
+    if (this.tables.has(key)) throw new SqlError(`table ${stmt.name} already exists`);
+    if (this.views.has(key)) {
+      if (stmt.ifNotExists) return;
+      throw new SqlError(`view ${stmt.name} already exists`);
+    }
+    // Like SQLite, problems in the query (missing tables, wrong column count) surface when the view is used.
+    this.views.set(key, { name: stmt.name, columns: stmt.columns, query: stmt.query, sql: stmt.sql });
+  }
+
   private createTable(stmt: CreateTableStmt, ctx: ExecContext): void {
     const key = stmt.name.toLowerCase();
+    if (this.views.has(key)) throw new SqlError(`view ${stmt.name} already exists`);
     if (this.tables.has(key)) {
       if (stmt.ifNotExists) return;
       throw new SqlError(`table ${stmt.name} already exists`);

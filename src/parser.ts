@@ -5,7 +5,7 @@
  *      < (& | << >>) < (+ -) < (* / %) < || < unary (- + ~) < primary
  */
 import type {
-  BinaryOp, ColumnDef, CommonTableExpr, CompoundOp, CreateTableStmt, Expr, FromItem, OrderTerm,
+  BinaryOp, ColumnDef, CommonTableExpr, CompoundOp, CreateTableStmt, CreateViewStmt, Expr, FromItem, OrderTerm,
   SelectCore, SelectItem, SelectStmt, Statement,
 } from "./ast";
 import { SqlSyntaxError, tokenize, type Token } from "./lexer";
@@ -115,7 +115,12 @@ export class Parser {
 
   statement(): Statement {
     if (this.isSelectStart() || this.isOp("(")) return this.select();
+    if (this.isKw("CREATE") && this.isKw("VIEW", 1)) return this.createView();
     if (this.acceptKw("CREATE")) return this.createTable();
+    if (this.acceptKw("DROP", "VIEW")) {
+      const ifExists = this.acceptKw("IF", "EXISTS");
+      return { kind: "dropView", name: this.identifier("view name"), ifExists };
+    }
     if (this.acceptKw("DROP")) {
       this.expectKw("TABLE");
       const ifExists = this.acceptKw("IF", "EXISTS");
@@ -153,6 +158,18 @@ export class Parser {
       return { kind: "rollback" };
     }
     return this.fail("expected a statement");
+  }
+
+  private createView(): CreateViewStmt {
+    const start = this.next().start; // CREATE
+    this.next(); // VIEW
+    const ifNotExists = this.acceptKw("IF", "NOT", "EXISTS");
+    const name = this.identifier("view name");
+    const columns = this.isOp("(") ? this.nameList() : undefined;
+    this.expectKw("AS");
+    const query = this.select();
+    const end = this.tokens[this.pos - 1]!.end;
+    return { kind: "createView", name, ifNotExists, columns, query, sql: this.sql.slice(start, end) };
   }
 
   private createTable(): CreateTableStmt {

@@ -29,6 +29,7 @@ minisql> SELECT coalesce(dept, '-') AS dept, count(*) AS n, avg(salary) AS avg
 - **Set operations:** `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT`.
 - **Common table expressions:** `WITH name [(columns)] AS (SELECT ...)`, several per clause and in any order, usable wherever a `SELECT` is (subqueries, `INSERT ... SELECT`, `CREATE TABLE ... AS`). Each one is computed at most once per statement, unless it reads a column of an enclosing query. The `MATERIALIZED` hints are accepted and ignored.
 - **Recursive queries:** `WITH RECURSIVE` with SQLite's semantics. Rows from the anchor `SELECT`s go into a queue, and each row taken from it is emitted and fed to every recursive `SELECT`. `UNION` skips rows already seen (so walks over cyclic graphs finish), `ORDER BY` turns the queue into a priority queue, and `LIMIT`/`OFFSET` apply as rows come out, so `LIMIT` can stop an unbounded recursion. A runaway query fails after 1,000,000 rows (configurable with `maxRecursiveRows`).
+- **Views:** `CREATE VIEW [IF NOT EXISTS] name [(columns)] AS SELECT ...` and `DROP VIEW [IF EXISTS]`. Views are read-only, are computed once per statement where they're used, and are rolled back with transactions.
 - **Expressions:** arithmetic, `||`, bitwise operators, comparisons, `AND`/`OR`/`NOT` with three-valued logic, `IS [NOT]`, `[NOT] BETWEEN`, `[NOT] IN (...)`, `[NOT] LIKE ... [ESCAPE]`, `CASE`, `CAST`, and `?`, `?N`, `:name`, `@name` and `$name` parameters.
 - **Functions:** `abs`, `coalesce`, `ifnull`, `nullif`, `iif`, `length`, `lower`, `upper`, `substr`, `trim`/`ltrim`/`rtrim`, `replace`, `instr`, `round`, `sign`, `typeof`, `printf`, `concat`, and scalar `min`/`max`. Aggregates are `count(*)`, `count`, `sum`, `total`, `avg`, `min`, `max` and `group_concat`, each also with `DISTINCT`.
 - **DDL and DML:** `CREATE TABLE [IF NOT EXISTS]` (including `AS SELECT`), `DROP TABLE [IF EXISTS]`, `INSERT` (`VALUES`, `SELECT`, `DEFAULT VALUES`, `OR IGNORE`, `OR REPLACE`), `UPDATE` and `DELETE`.
@@ -71,7 +72,7 @@ bun src/cli.ts -m csv -c "SELECT 1 AS one"
 cat queries.sql | bun src/cli.ts
 ```
 
-Dot commands are `.tables`, `.schema [table]`, `.mode table|csv|json`, `.timer on|off`, `.read FILE`, `.help` and `.quit`.
+Dot commands are `.tables` (tables and views), `.schema [name]`, `.mode table|csv|json`, `.timer on|off`, `.read FILE`, `.help` and `.quit`.
 
 ## How it works
 
@@ -80,9 +81,9 @@ Dot commands are `.tables`, `.schema [table]`, `.mode table|csv|json`, `.timer o
 | `src/lexer.ts` | Tokenizer: strings with `''` escapes, quoted identifiers, numbers (including hex), parameters and comments. Every token keeps its source offsets for error messages and column names. |
 | `src/parser.ts` | Recursive-descent parser producing the AST in `src/ast.ts`, with SQLite's operator precedence. |
 | `src/values.ts` | Value model, comparison and ordering, affinity, `CAST`, and hashing keys for grouping and uniqueness. |
-| `src/executor.ts` | Expression evaluator and the `SELECT` pipeline: FROM and joins, then WHERE, grouping, HAVING, projection, DISTINCT, compound operators, ORDER BY and LIMIT. |
+| `src/executor.ts` | Expression evaluator and the `SELECT` pipeline: FROM and joins, then WHERE, grouping, HAVING, projection, DISTINCT, compound operators, ORDER BY and LIMIT, plus CTEs (including the recursive queue) and view expansion. |
 | `src/functions.ts` | Scalar functions, aggregates and `LIKE`. |
-| `src/database.ts` | Tables, constraint indexes, DML, DDL, transactions and the public API. |
+| `src/database.ts` | Tables, views, constraint indexes, DML, DDL, transactions and the public API. |
 | `src/shell.ts`, `src/format.ts`, `src/cli.ts` | REPL logic (kept free of I/O so it is unit tested), output formatting, and the terminal front end. |
 
 Rows are immutable arrays, which keeps transactions cheap. `BEGIN` snapshots each table by copying its array of row references, and `UPDATE` writes new row arrays instead of mutating old ones.
@@ -95,7 +96,7 @@ A `WITH` clause adds frames to a CTE environment that is lexical, like the scope
 
 ```sh
 bun install
-bun test               # about 90 unit tests plus the differential fuzzer
+bun test               # about 95 unit tests plus the differential fuzzer
 bun run typecheck      # tsc --noEmit, strict mode
 FUZZ_SEEDS=20000 bun test --timeout 0 test/differential.test.ts   # a much longer fuzz run
 ```
@@ -104,7 +105,7 @@ FUZZ_SEEDS=20000 bun test --timeout 0 test/differential.test.ts   # a much longe
 
 ## Limitations
 
-This is an in-memory engine for learning and testing, not a replacement for SQLite. It has no persistence, no secondary indexes or query planner beyond the hash join, no window functions, views, triggers, `ALTER TABLE` or BLOBs, and no `CHECK` or foreign-key enforcement. Uniqueness checks use hash maps, but `UPDATE` and `DELETE` rebuild them, so each of those statements is O(table size).
+This is an in-memory engine for learning and testing, not a replacement for SQLite. It has no persistence, no secondary indexes or query planner beyond the hash join, no window functions, triggers, `ALTER TABLE` or BLOBs, and no `CHECK` or foreign-key enforcement. Uniqueness checks use hash maps, but `UPDATE` and `DELETE` rebuild them, so each of those statements is O(table size).
 
 ## License
 

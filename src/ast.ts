@@ -95,6 +95,22 @@ export interface CreateTableStmt {
   asSelect?: SelectStmt;
 }
 
+export interface CreateViewStmt {
+  kind: "createView";
+  name: string;
+  ifNotExists: boolean;
+  columns?: string[];
+  query: SelectStmt;
+  /** The statement's source text, kept for .schema. */
+  sql: string;
+}
+
+export interface DropViewStmt {
+  kind: "dropView";
+  name: string;
+  ifExists: boolean;
+}
+
 export interface DropTableStmt {
   kind: "dropTable";
   name: string;
@@ -129,6 +145,8 @@ export type Statement =
   | SelectStmt
   | CreateTableStmt
   | DropTableStmt
+  | CreateViewStmt
+  | DropViewStmt
   | InsertStmt
   | UpdateStmt
   | DeleteStmt
